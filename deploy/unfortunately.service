@@ -1,0 +1,22 @@
+[Unit]
+Description=Unfortunately application journal
+After=network.target
+
+[Service]
+Type=simple
+User=leo
+Group=leo
+WorkingDirectory=/opt/apps/unfortunately/current
+EnvironmentFile=/opt/apps/unfortunately/shared/runtime.env
+ExecStart=/usr/bin/node server/index.js
+Restart=on-failure
+RestartSec=4
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/apps/unfortunately/shared/data
+
+[Install]
+WantedBy=multi-user.target

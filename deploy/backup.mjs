@@ -1,0 +1,12 @@
+import Database from 'better-sqlite3';
+import { mkdirSync, readdirSync, unlinkSync } from 'node:fs';
+import { resolve } from 'node:path';
+const root = '/opt/apps/unfortunately/shared/data';
+const destination = resolve(root, 'backups');
+mkdirSync(destination, { recursive: true, mode: 0o700 });
+const db = new Database(resolve(root, 'unfortunately.sqlite'), { readonly: true });
+await db.backup(resolve(destination, new Date().toISOString().replaceAll(':','-') + '.sqlite'));
+db.close();
+const files = readdirSync(destination).filter(s => s.endsWith('.sqlite')).sort();
+for (const file of files.slice(0, -14)) unlinkSync(resolve(destination,file));
+console.log('Database backup completed');
