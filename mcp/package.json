@@ -1,0 +1,17 @@
+{
+  "name": "unfortunately-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22 <23" },
+  "scripts": {
+    "start": "node index.js",
+    "login": "node login.js",
+    "logout": "node login.js --logout",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "^4.5.4"
+  }
+}
