@@ -22,6 +22,9 @@ if test -L "$root/current"; then
         (cd "$root/current" && node deploy/backup.mjs)
     fi
 fi
+cp "$root/shared/runtime.env" "$backup_path/runtime-before.env"
+chmod 600 "$backup_path/runtime-before.env"
+node deploy/set-revision.mjs
 ln -s "$release_path" "$root/current.next"
 mv -Tf "$root/current.next" "$root/current"
 sudo install -m 644 deploy/unfortunately.service /etc/systemd/system/unfortunately.service

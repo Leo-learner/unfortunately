@@ -2,6 +2,9 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ArrowRight, ArrowUpRight, Search, ChevronLeft, ChevronRight, X, Plus, Download, LogOut, RefreshCw, LockKeyhole, Pencil, Trash2, Check, Mail } from 'lucide-react';
 import './style.css';
+import { api, ApiError, errorText } from './api';
+import { Modal } from './Modal';
+import { Comments } from './Comments';
 
 const statuses = {
   rejected: { label: '已婉拒', color: '#c95432' },
@@ -20,25 +23,6 @@ type Draft = { company: string; role: string; kind: Kind; appliedOn: string; sta
 const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 const dateLabel = (s: string) => s.replaceAll('-', '.');
 const freshDraft = (): Draft => ({ company: '', role: '', kind: 'internship', appliedOn: today(), status: 'pending', rejectedOn: today(), notes: '' });
-class ApiError extends Error { constructor(message: string, public status: number) { super(message); } }
-async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
-  let res: Response;
-  try { res = await fetch('/api' + path, { method, credentials: 'same-origin', headers: body === undefined ? {} : { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) }); }
-  catch { throw new Error('网络暂时连不上，请检查连接后重试。'); }
-  const value = await res.json();
-  if (!res.ok) throw new ApiError(value.error || '操作失败，请重试。', res.status);
-  return value;
-}
-const errorText = (e: unknown) => e instanceof Error ? e.message : '操作失败，请重试。';
-
-function Modal({ title, children, onClose, busy = false, className = '' }: { title: string; children: React.ReactNode; onClose: () => void; busy?: boolean; className?: string }) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => { const dialog = ref.current!; const previous = document.activeElement as HTMLElement; dialog.showModal(); (dialog.querySelector("input, textarea, select") as HTMLElement | null)?.focus(); document.body.style.overflow = 'hidden'; return () => { dialog.close(); document.body.style.overflow = ''; previous?.focus(); }; }, []);
-  return <dialog ref={ref} className={`modal ${className}`} onCancel={e => { e.preventDefault(); if (!busy) onClose(); }} aria-labelledby="modal-title">
-    <div className="modal-head"><h2 id="modal-title">{title}</h2><button className="icon-button" aria-label="关闭窗口" disabled={busy} onClick={onClose}><X size={20}/></button></div>{children}
-  </dialog>;
-}
-
 function Login({ onClose, onLogin }: { onClose: () => void; onLogin: () => void }) {
   const [email, setEmail] = useState('');
   const [code, setCode] = useState('');
@@ -186,6 +170,7 @@ function App() {
         </div>
         <div className="table-bottom"><span>{data ? hasFilters ? `找到 ${items.length} 条 · 共 ${total} 条投递记录` : `共 ${total} 条投递记录` : '正在加载'}{loading && data && <RefreshCw className="loading-icon" size={12}/>}</span><div className="pagination" aria-label="翻页"><button className="icon-button" disabled={currentPage === 1} aria-label="上一页" onClick={() => setPage(currentPage - 1)}><ChevronLeft size={18}/></button><span>{currentPage} <em>/ {pages}</em></span><button className="icon-button" disabled={currentPage === pages} aria-label="下一页" onClick={() => setPage(currentPage + 1)}><ChevronRight size={18}/></button></div></div>
       </section>
+      <Comments admin={admin}/>
     </main>
     <footer><p>被拒的是这次申请，不是我。</p><span>{data?.updatedAt ? `最后更新 ${new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(data.updatedAt)).replaceAll('/', '.')}` : '记录，慢慢来。'}</span></footer>
     {notice && <div className="toast" role="status"><Check size={17}/>{notice}</div>}

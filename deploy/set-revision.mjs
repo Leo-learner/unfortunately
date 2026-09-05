@@ -1,0 +1,12 @@
+import { basename } from 'node:path';
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+const revision = basename(process.cwd());
+if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error('Release directory must be an exact Git commit');
+const file = '/opt/apps/unfortunately/shared/runtime.env';
+const original = readFileSync(file, 'utf8');
+const line = `APP_REVISION=${revision}`;
+const updated = /^APP_REVISION=.*$/m.test(original) ? original.replace(/^APP_REVISION=.*$/m, line) : `${original.trimEnd()}\n${line}\n`;
+const temporary = `${file}.next-${process.pid}`;
+writeFileSync(temporary, updated, { mode: 0o600, flag: 'wx' });
+renameSync(temporary, file);
+console.log(`Release revision set to ${revision}`);

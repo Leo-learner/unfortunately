@@ -4,6 +4,7 @@ import { rateLimit } from 'express-rate-limit';
 import { z } from 'zod';
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { openDatabase, snapshot } from './database.js';
+import { installComments } from './comments.js';
 
 const hash = s => createHash('sha256').update(s).digest('hex');
 const emailSchema = z.string().trim().toLowerCase().email().max(254);
@@ -19,7 +20,7 @@ const fields = z.object({
   version: z.number().int().positive().optional(),
 }).strict();
 
-export function createApp({ databasePath = ':memory:', adminEmail, secret, origin, sendCode, production = false, now = Date.now, staticDir, revision = 'development' }) {
+export function createApp({ databasePath = ':memory:', adminEmail, secret, origin, sendCode, production = false, now = Date.now, staticDir, revision = 'development', visitorDailyLimit = 200 }) {
   if (!adminEmail || !secret || secret.length < 32 || !origin) throw new Error('Missing secure application configuration');
   adminEmail = emailSchema.parse(adminEmail);
   const db = openDatabase(databasePath);
@@ -92,8 +93,10 @@ export function createApp({ databasePath = ':memory:', adminEmail, secret, origi
     db.prepare('INSERT INTO sessions VALUES (?, ?)').run(hash(token), now() + 30 * 24 * 60 * 60_000);
     res.cookie(cookieName, token, { ...cookieOptions, maxAge: 30 * 24 * 60 * 60_000 }).json({ authenticated: true });
   });
+  const { clearVisitor } = installComments(app, { db, adminEmail, secret, sendCode, production, now, visitorDailyLimit });
   app.post('/api/auth/logout', (req, res) => {
     if (req.sessionDigest) db.prepare('DELETE FROM sessions WHERE digest = ?').run(req.sessionDigest);
+    clearVisitor(req, res);
     res.clearCookie(cookieName, cookieOptions).json({ ok: true });
   });
   const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(now()));

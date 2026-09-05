@@ -18,10 +18,11 @@ const { app, db } = createApp({
   adminEmail: process.env.ADMIN_EMAIL,
   secret: process.env.SESSION_SECRET,
   origin: process.env.APP_ORIGIN || `http://127.0.0.1:${port}`,
+  visitorDailyLimit: Number(process.env.VISITOR_MAIL_DAILY_LIMIT || 200),
   production, staticDir: resolve('dist'), revision: process.env.APP_REVISION || 'development',
   sendCode: async (email, code) => {
     if (!mailer) throw new Error('Mail is not configured');
-    await mailer.sendMail({ from: { name: 'unfortunately. 管理登录', address: process.env.MAIL_FROM || process.env.SMTP_USER }, to: email,
+    await mailer.sendMail({ from: { name: 'unfortunately. 登录验证', address: process.env.MAIL_FROM || process.env.SMTP_USER }, to: email,
       subject: '你的 unfortunately. 登录验证码',
       text: `你的登录验证码是：${code}\n\n10 分钟内有效，仅可使用一次。请勿转发。\n如果不是你本人操作，请忽略此邮件。`,
     });
