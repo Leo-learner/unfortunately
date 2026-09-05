@@ -8,4 +8,3 @@ export function Modal({ title, children, onClose, busy = false, className = '' }
     <div className="modal-head"><h2 id="modal-title">{title}</h2><button className="icon-button" aria-label="关闭窗口" disabled={busy} onClick={onClose}><X size={20}/></button></div>{children}
   </dialog>;
 }
-

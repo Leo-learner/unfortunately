@@ -8,4 +8,3 @@ export async function api<T>(path: string, method = 'GET', body?: unknown): Prom
   return value;
 }
 export const errorText = (e: unknown) => e instanceof Error ? e.message : '操作失败，请重试。';
-

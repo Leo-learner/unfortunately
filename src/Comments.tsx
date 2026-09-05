@@ -87,7 +87,7 @@ export function Comments({ admin }: { admin: boolean }) {
   const rootKey = useRef(crypto.randomUUID());
   const replyKey = useRef(crypto.randomUUID());
   const posting = useRef(false);
-  
+
   const refresh = useCallback(async () => {
     const id = ++generation.current;
     setLoading(true);
