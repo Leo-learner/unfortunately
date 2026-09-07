@@ -1,26 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, statSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, statSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { createApp } from '../../server/app.js';
 import { createMcp } from '../server.js';
-import { createApi, readSession, SITE } from '../api.js';
+import { createApi, readSession, readAdminKey, SITE } from '../api.js';
 import { createLogin } from '../auth.js';
 
-async function fixture(t) {
+async function fixture(t, key = null) {
   let clock = Date.UTC(2026, 8, 5), code, active = null;
   const directory = mkdtempSync(join(tmpdir(), 'unfortunately-mcp-test-'));
   const file = join(directory, 'session.json');
-  const { app, db } = createApp({ adminEmail: 'owner@example.com', secret: 'mcp-test-secret-abcdefghijklmnopqrstuvwxyz', origin: SITE, production: true, now: () => clock, sendCode: async (_, value) => { code = value; } });
+  const { app, db } = createApp({ adminEmail: 'owner@example.com', secret: 'mcp-test-secret-abcdefghijklmnopqrstuvwxyz', origin: SITE, production: true, mcpAdminKeyHash: key ? createHash('sha256').update(key).digest('hex') : '', now: () => clock, sendCode: async (_, value) => { code = value; } });
   const http = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   const origin = `http://127.0.0.1:${http.address().port}`;
   const fetchImpl = (url, options) => fetch(origin + new URL(url).pathname + new URL(url).search, options);
-  const api = createApi({ fetchImpl, getSession: () => active });
+  const keyFile = join(directory, 'admin-key.txt');
+  if (key) writeFileSync(keyFile, key, { mode: 0o600 });
+  const api = createApi({ fetchImpl, getSession: () => active, getAdminKey: () => key ? readAdminKey(keyFile) : null });
   const mcp = createMcp({ api });
   const client = new Client({ name: 'test-client', version: '1' });
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
@@ -28,7 +30,7 @@ async function fixture(t) {
   t.after(async () => { await client.close(); await mcp.close(); await new Promise(resolve => http.close(resolve)); db.close(); rmSync(directory, { recursive: true, force: true }); });
   const login = createLogin({ file, fetchImpl });
   return {
-    client, file, db, api, fetchImpl,
+    client, file, keyFile, db, api, fetchImpl,
     tick: () => { clock += 61_000; },
     anonymous: () => { active = null; },
     use: value => { active = value; },
@@ -38,6 +40,35 @@ async function fixture(t) {
 }
 const record = { company: '私密公司', role: '前端实习生', kind: 'internship', appliedOn: '2026-09-01', status: 'pending', notes: '私人备注' };
 const data = result => { assert.ok(!result.isError, JSON.stringify(result)); return result.structuredContent; };
+
+test('MCP reads the private administrator key automatically and completes real tools without OTP', async t => {
+  const key = 'uf_ai_' + randomBytes(32).toString('hex');
+  const f = await fixture(t, key);
+  assert.equal(data(await f.call('get_account_status')).administrator, true);
+  const created = data(await f.call('create_application', record));
+  assert.equal(data(await f.call('get_application', { id: created.id })).item.notes, record.notes);
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM challenges').get().n, 0);
+  assert.ok(!JSON.stringify(await f.call('get_account_status')).includes(key));
+  chmodSync(f.keyFile, 0o644);
+  assert.equal((await f.call('get_account_status')).isError, true);
+  chmodSync(f.keyFile, 0o600);
+  writeFileSync(f.keyFile, 'uf_ai_' + randomBytes(32).toString('hex'));
+  assert.equal((await f.call('export_applications')).structuredContent.status, 401);
+  writeFileSync(f.keyFile, key);
+  assert.equal(data(await f.call('get_account_status')).administrator, true);
+});
+
+test('public queries send no key and private key requests do not send browser cookies or follow redirects', async () => {
+  const key = 'uf_ai_' + randomBytes(32).toString('hex');
+  const seen = [];
+  const api = createApi({ getAdminKey: () => key, getSession: () => { throw new Error('cookie should not be read'); }, fetchImpl: async (url, options) => { seen.push(options); return { ok: true, json: async () => ({ ok: true }) }; } });
+  await api.request('/public/applications', 'GET', undefined, { authenticated: false });
+  await api.request('/admin/applications');
+  assert.equal(seen[0].headers.Authorization, undefined);
+  assert.equal(seen[1].headers.Authorization, `Bearer ${key}`);
+  assert.equal(seen[1].headers.Cookie, undefined);
+  assert.equal(seen[1].redirect, 'error');
+});
 
 test('real MCP discovery and anonymous boundaries exclude private fields and auth secrets', async t => {
   const f = await fixture(t);

@@ -8,4 +8,6 @@ data/
 coverage/
 .DS_Store
 *.log
+admin-key.txt
+session.json
 work/

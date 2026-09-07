@@ -17,6 +17,7 @@ const { app, db } = createApp({
   databasePath: process.env.DATABASE_PATH || './data/unfortunately.sqlite',
   adminEmail: process.env.ADMIN_EMAIL,
   secret: process.env.SESSION_SECRET,
+  mcpAdminKeyHash: process.env.MCP_ADMIN_KEY_HASH_FILE ? readFileSync(process.env.MCP_ADMIN_KEY_HASH_FILE, 'utf8').trim() : '',
   origin: process.env.APP_ORIGIN || `http://127.0.0.1:${port}`,
   visitorDailyLimit: Number(process.env.VISITOR_MAIL_DAILY_LIMIT || 200),
   production, staticDir: resolve('dist'), revision: process.env.APP_REVISION || 'development',

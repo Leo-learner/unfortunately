@@ -5,11 +5,44 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../server/app.js';
+import { createHash, randomBytes } from 'node:crypto';
 
 const origin = 'http://127.0.0.1:3210';
 const email = 'owner@example.com';
 const secret = 'test-only-secret-abcdefghijklmnopqrstuvwxyz';
 const draft = { company: 'PRIVATE_COMPANY', role: '产品设计实习生', kind: 'internship', appliedOn: '2026-09-01', status: 'pending', notes: 'PRIVATE_NOTES' };
+test('dedicated administrator key works without OTP, never leaks, and cannot be used as a session cookie', async t => {
+  const key = 'uf_ai_' + randomBytes(32).toString('hex');
+  const digest = createHash('sha256').update(key).digest('hex');
+  const f = fixture(t, { mcpAdminKeyHash: digest });
+  const auth = req => req.set('Authorization', `Bearer ${key}`);
+  assert.equal((await auth(request(f.app).get('/api/session'))).body.authenticated, true);
+  const created = await auth(request(f.app).post('/api/admin/applications')).set('Origin', origin).send(draft).expect(201);
+  assert.equal(f.mails(), 0);
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM sessions').get().n, 0);
+  const commentSession = await auth(request(f.app).get('/api/comments/session')).expect(200);
+  assert.equal(commentSession.body.isAdmin, true);
+  assert.equal(commentSession.body.profile.isOwner, true);
+  for (const path of ['/api/health', '/api/session', '/api/comments/session', '/api/public/applications']) {
+    const res = await auth(request(f.app).get(path));
+    assert.ok(!res.text.includes(key)); assert.ok(!res.text.includes(digest));
+    assert.equal(res.headers['set-cookie'], undefined);
+  }
+  await request(f.app).get('/api/admin/applications').set('Cookie', `unfortunately-session=${key}`).expect(401);
+  await request(f.app).get('/api/admin/applications').set('Authorization', `Bearer ${digest}`).expect(401);
+  await auth(request(f.app).post('/api/admin/applications')).set('Origin', 'https://other.example').send(draft).expect(403);
+  await auth(request(f.app).delete(`/api/admin/applications/${created.body.id}`)).set('Origin', origin).send({ version: 1 }).expect(200);
+});
+test('disabled or rotated keys fail closed while existing browser sessions remain valid', async t => {
+  const key = 'uf_ai_' + randomBytes(32).toString('hex');
+  for (const mcpAdminKeyHash of ['', createHash('sha256').update('different-key').digest('hex')]) {
+    const f = fixture(t, { mcpAdminKeyHash });
+    await request(f.app).get('/api/admin/applications').set('Authorization', `Bearer ${key}`).expect(401);
+    await f.login(); await f.client.get('/api/admin/applications').expect(200);
+    await f.client.get('/api/admin/applications').set('Authorization', 'Bearer invalid').expect(401);
+  }
+  assert.throws(() => createApp({ adminEmail: email, secret, origin, mcpAdminKeyHash: 'broken' }));
+});
 function fixture(t, opts = {}) {
   let code, time = Date.parse('2026-09-05T03:00:00Z'), mails = 0;
   const { app, db } = createApp({ adminEmail: email, secret, origin, now: () => time, sendCode: async (_, value) => { code = value; mails++; }, ...opts });

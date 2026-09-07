@@ -3,11 +3,15 @@ import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { existsSync } from 'node:fs';
 import { createLogin } from './auth.js';
-import { SITE, sessionPath } from './api.js';
+import { SITE, sessionPath, adminKeyPath } from './api.js';
 
 const auth = createLogin();
 if (process.argv.includes('--logout')) {
   try {
+    if (existsSync(adminKeyPath())) {
+      console.log('当前使用 AI 管理员密钥，不依赖邮箱会话。撤销密钥需删除或更换服务器上的密钥摘要并重启服务；邮箱退出不会撤销密钥。');
+      process.exit(0);
+    }
     if (existsSync(sessionPath())) await auth.logout();
     console.log('已退出本机 MCP 登录。');
   } catch { console.error('退出失败，登录文件仍保留。请检查网络后重试，以确保服务器会话也被撤销。'); process.exitCode = 1; }

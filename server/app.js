@@ -20,8 +20,9 @@ const fields = z.object({
   version: z.number().int().positive().optional(),
 }).strict();
 
-export function createApp({ databasePath = ':memory:', adminEmail, secret, origin, sendCode, production = false, now = Date.now, staticDir, revision = 'development', visitorDailyLimit = 200 }) {
+export function createApp({ databasePath = ':memory:', adminEmail, secret, origin, sendCode, production = false, now = Date.now, staticDir, revision = 'development', visitorDailyLimit = 200, mcpAdminKeyHash = '' }) {
   if (!adminEmail || !secret || secret.length < 32 || !origin) throw new Error('Missing secure application configuration');
+  if (mcpAdminKeyHash && !/^[a-f0-9]{64}$/.test(mcpAdminKeyHash)) throw new Error('Invalid MCP administrator key hash');
   adminEmail = emailSchema.parse(adminEmail);
   const db = openDatabase(databasePath);
   const app = express();
@@ -45,7 +46,11 @@ export function createApp({ databasePath = ':memory:', adminEmail, secret, origi
   };
   app.use('/api', (req, res, next) => {
     req.sessionDigest = sessionDigest(req);
-    req.isAdmin = !!(req.sessionDigest && db.prepare('SELECT digest FROM sessions WHERE digest = ? AND expiresAt > ?').get(req.sessionDigest, now()));
+    const authorization = req.get('authorization');
+    const apiKey = authorization?.match(/^Bearer (uf_ai_[a-f0-9]{64})$/)?.[1];
+    // A dedicated key never becomes a browser cookie or a visitor session.
+    const keyAdmin = !!(mcpAdminKeyHash && apiKey && timingSafeEqual(Buffer.from(hash(apiKey), 'hex'), Buffer.from(mcpAdminKeyHash, 'hex')));
+    req.isAdmin = authorization ? keyAdmin : !!(req.sessionDigest && db.prepare('SELECT digest FROM sessions WHERE digest = ? AND expiresAt > ?').get(req.sessionDigest, now()));
     next();
   });
   const mustAdmin = (req, res, next) => req.isAdmin ? next() : res.status(401).json({ error: '请先登录管理员账号。' });
