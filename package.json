@@ -15,12 +15,11 @@
     "check": "npm test && npm run build"
   },
   "dependencies": {
+    "@clerk/backend": "3.22.0",
     "better-sqlite3": "^13.0.3",
     "express": "^5.2.1",
-    "express-rate-limit": "^8.7.0",
     "helmet": "^8.3.0",
     "lucide-react": "^1.41.0",
-    "nodemailer": "^10.0.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "zod": "^4.5.4"
