@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { ArrowRight, ChevronLeft, ChevronRight, Mail, MessageCircle, Reply, Trash2 } from 'lucide-react';
+import { ArrowRight, ChevronLeft, ChevronRight, LogIn, MessageCircle, Reply, Trash2 } from 'lucide-react';
 import { api, ApiError, errorText } from './api';
 import { Modal } from './Modal';
+import { requireSignIn, signOut } from './vendor/clerk-boot.js';
 import './comments.css';
 
 type Profile = { nickname: string | null; needsNickname: boolean; isOwner: boolean };
@@ -16,45 +17,30 @@ const anonymous: Session = { authenticated: false, profile: null, isAdmin: false
 const formatDate = (n: number) => new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(n));
 const lengthOf = (s: string) => [...s.trim()].length;
 
-function CommentLogin({ session, onClose, onSuccess }: { session: Session; onClose: () => void; onSuccess: () => void }) {
-  const [step, setStep] = useState<'email' | 'code' | 'nickname'>(session.profile?.needsNickname ? 'nickname' : 'email');
-  const [email, setEmail] = useState('');
-  const [code, setCode] = useState('');
+const DRAFT_KEY = 'unfortunately.comment-draft';
+// Commenting signs in with the shared dkz12345 account. Keep the draft across
+// the round trip to the account page.
+function signInToComment(draft: string) {
+  try { if (draft.trim()) sessionStorage.setItem(DRAFT_KEY, draft); } catch { /* storage unavailable */ }
+  void requireSignIn(`${location.origin}${location.pathname}`);
+}
+
+function NicknameDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const [nickname, setNickname] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [cooldown, setCooldown] = useState(0);
-  useEffect(() => { if (cooldown <= 0) return; const t = setTimeout(() => setCooldown(cooldown - 1), 1000); return () => clearTimeout(t); }, [cooldown]);
-  async function send() {
-    setBusy(true); setError('');
-    try { await api('/comments/auth/request-code', 'POST', { email }); setStep('code'); setCooldown(60); }
-    catch (e) { setError(errorText(e)); } finally { setBusy(false); }
-  }
   async function submit(e: FormEvent) {
     e.preventDefault();
-    if (step === 'email') return send();
     setBusy(true); setError('');
-    try {
-      if (step === 'code') {
-        const result = await api<Session>('/comments/auth/verify', 'POST', { email, code });
-        if (result.profile?.needsNickname) setStep('nickname'); else onSuccess();
-      } else {
-        await api('/comments/profile', 'PUT', { nickname }); onSuccess();
-      }
-    } catch (e) {
-      setError(errorText(e));
-      if (e instanceof ApiError && e.status === 401) setStep('email');
-    } finally { setBusy(false); }
+    try { await api('/comments/profile', 'PUT', { nickname }); onSuccess(); }
+    catch (e) { setError(errorText(e)); } finally { setBusy(false); }
   }
-  return <Modal title={step === 'nickname' ? '怎么称呼你？' : '登录后，聊两句'} onClose={onClose} busy={busy} className="login-modal">
-    <p className="modal-intro">{step === 'nickname' ? '选一个公开昵称，用它留下你的声音。' : '用邮箱验证码登录，无需设置密码。邮箱仅用于登录，不会公开展示。'}</p>
+  return <Modal title="怎么称呼你？" onClose={onClose} busy={busy} className="login-modal">
+    <p className="modal-intro">选一个公开昵称，用它留下你的声音。设置后不能修改。</p>
     <form onSubmit={submit}>
-      {step !== 'nickname' && <label>你的邮箱<input type="email" autoComplete="email" required maxLength={254} value={email} disabled={step === 'code' || busy} placeholder="输入邮箱地址" onChange={e => setEmail(e.target.value)}/></label>}
-      {step === 'code' && <><label>访客验证码<input autoFocus required autoComplete="one-time-code" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} value={code} placeholder="6 位验证码" onChange={e => setCode(e.target.value.replace(/\D/g, ''))}/></label><p className="form-hint">验证码已发送，10 分钟内有效。也请检查垃圾邮件。</p></>}
-      {step === 'nickname' && <label>公开昵称<input autoFocus required value={nickname} maxLength={48} placeholder="1–24 字，不必使用真实姓名" onChange={e => setNickname(e.target.value)}/></label>}
+      <label>公开昵称<input autoFocus required value={nickname} maxLength={48} placeholder="1–24 字，不必使用真实姓名" onChange={e => setNickname(e.target.value)}/></label>
       {error && <p className="form-error" role="alert">{error}</p>}
-      <button className="primary full" disabled={busy || (step === 'nickname' && (lengthOf(nickname) < 1 || lengthOf(nickname) > 24))}>{busy ? '请稍等…' : step === 'email' ? '发送验证码' : step === 'code' ? '验证并登录' : '保存昵称'}{step === 'email' ? <Mail size={16}/> : <ArrowRight size={16}/>}</button>
-      {step === 'code' && <div className="login-secondary"><button type="button" className="text-button" disabled={busy || cooldown > 0} onClick={send}>{cooldown > 0 ? `${cooldown} 秒后重新发送` : '重新发送'}</button><button type="button" className="text-button" disabled={busy} onClick={() => { setStep('email'); setCode(''); setError(''); }}>更换邮箱</button></div>}
+      <button className="primary full" disabled={busy || lengthOf(nickname) < 1 || lengthOf(nickname) > 24}>{busy ? '请稍等…' : '保存昵称'}<ArrowRight size={16}/></button>
     </form>
   </Modal>;
 }
@@ -66,14 +52,15 @@ function CommentBody({ item, onReply, onDelete }: { item: Comment; onReply: (c: 
   </article>;
 }
 
-export function Comments({ admin }: { admin: boolean }) {
+// account: the signed-in Clerk user id, so the list refreshes when it changes.
+export function Comments({ admin, account }: { admin: boolean; account: string | null }) {
   const [session, setSession] = useState<Session>(anonymous);
   const [data, setData] = useState<CommentPage | null>(null);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const [draft, setDraft] = useState('');
+  const [draft, setDraft] = useState(() => { try { const saved = sessionStorage.getItem(DRAFT_KEY) || ''; sessionStorage.removeItem(DRAFT_KEY); return saved; } catch { return ''; } });
   const [replyDraft, setReplyDraft] = useState('');
   const [replying, setReplying] = useState<Comment | null>(null);
   const [login, setLogin] = useState(false);
@@ -98,7 +85,7 @@ export function Comments({ admin }: { admin: boolean }) {
     } catch (e) { if (id === generation.current) setError(errorText(e)); }
     finally { if (id === generation.current) setLoading(false); }
   }, [page]);
-  useEffect(() => { refresh(); return () => { generation.current++; }; }, [refresh, admin]);
+  useEffect(() => { refresh(); return () => { generation.current++; }; }, [refresh, admin, account]);
   useEffect(() => {
     const onFocus = () => { if (!document.hidden && !posting.current) refresh(); };
     window.addEventListener('focus', onFocus);
@@ -112,7 +99,8 @@ export function Comments({ admin }: { admin: boolean }) {
   async function publish(e: FormEvent, reply = false) {
     e.preventDefault();
     if (posting.current) return;
-    if (!session.authenticated || session.profile?.needsNickname) { setLogin(true); return; }
+    if (!session.authenticated) { signInToComment(reply ? '' : draft); return; }
+    if (session.profile?.needsNickname) { setLogin(true); return; }
     const text = reply ? replyDraft : draft;
     const setFailure = reply ? setReplyError : setPostError;
     if (lengthOf(text) < 1 || lengthOf(text) > 2000) { setFailure('留言须为 1–2000 字。'); return; }
@@ -125,7 +113,7 @@ export function Comments({ admin }: { admin: boolean }) {
       if (!reply && page !== 1) setPage(1); else await refresh();
     } catch (e) {
       setFailure(errorText(e));
-      if (e instanceof ApiError && e.status === 401) { setSession(anonymous); setLogin(true); }
+      if (e instanceof ApiError && e.status === 401) setSession(anonymous);
     } finally { posting.current = false; setBusy(null); }
   }
   async function remove() {
@@ -138,10 +126,10 @@ export function Comments({ admin }: { admin: boolean }) {
     } catch (e) { setDeleteError(errorText(e)); }
     finally { setBusy(null); }
   }
-  async function logout() {
-    if (busy) return; setBusy('logout');
-    try { await api('/comments/auth/logout', 'POST', {}); setSession(anonymous); setNotice('已退出留言账号，草稿仍保留在当前页面。'); await refresh(); }
-    catch (e) { setError(errorText(e)); } finally { setBusy(null); }
+  function logout() {
+    if (busy) return;
+    // One sign-out covers every dkz12345 site, so check first.
+    if (window.confirm('退出会同时退出所有 dkz12345 网站的统一账号。确定退出吗？')) void signOut(`${location.origin}/`);
   }
   async function loadMore(thread: Thread) {
     if (!thread.replies.nextCursor || moreBusy) return;
@@ -152,7 +140,7 @@ export function Comments({ admin }: { admin: boolean }) {
       setData(current => current && ({ ...current, items: current.items.map(t => t.id === thread.id ? { ...t, replies: { items: [...t.replies.items, ...result.items.filter(r => !t.replies.items.some(old => old.id === r.id))], nextCursor: result.nextCursor } } : t) }));
     } catch (e) { setError(errorText(e)); } finally { setMoreBusy(null); }
   }
-  const loginLabel = session.authenticated ? '设置昵称后发表' : '验证邮箱后发表';
+  const loginLabel = session.authenticated ? '设置昵称后发表' : '登录后发表';
   const canPost = session.authenticated && !session.profile?.needsNickname;
   const composer = (reply: boolean) => <form className={`comment-composer ${reply ? 'reply-composer' : ''}`} onSubmit={e => publish(e, reply)}>
     {reply && <div className="reply-composer-title"><span>回复 {replying?.nickname}</span><button type="button" className="text-button" disabled={!!busy} onClick={() => setReplying(null)}>取消回复</button></div>}
@@ -162,7 +150,7 @@ export function Comments({ admin }: { admin: boolean }) {
     {(reply ? replyError : postError) && <p className="form-error" role="alert">{reply ? replyError : postError}</p>}
   </form>;
   return <section className="comments-section" id="comments" aria-labelledby="comments-heading">
-    <div className="comments-heading"><div><h2 id="comments-heading">留言区 <span>{data ? data.totalComments : '—'}</span></h2><p>求职路上，也听听你的故事。</p></div><div className="comment-account">{session.authenticated ? <><span>{session.profile?.nickname || '还差一个昵称'}{session.profile?.isOwner && <small>站长</small>}</span>{!session.isAdmin && <button className="text-button" disabled={!!busy} onClick={logout}>退出</button>}</> : <span><Mail size={14}/>邮箱验证后即可留言</span>}</div></div>
+    <div className="comments-heading"><div><h2 id="comments-heading">留言区 <span>{data ? data.totalComments : '—'}</span></h2><p>求职路上，也听听你的故事。</p></div><div className="comment-account">{session.authenticated ? <><span>{session.profile?.nickname || '还差一个昵称'}{session.profile?.isOwner && <small>站长</small>}</span>{!session.isAdmin && <button className="text-button" disabled={!!busy} onClick={logout}>退出</button>}</> : <button className="text-button" onClick={() => signInToComment(draft)}><LogIn size={14}/>登录 dkz12345 统一账号后即可留言</button>}</div></div>
     {composer(false)}
     <p className="comment-privacy">昵称和留言会公开展示，邮箱不会公开。请勿在内容中留下私人信息。</p>
     {notice && <p className="comment-notice" role="status">{notice}</p>}
@@ -175,7 +163,7 @@ export function Comments({ admin }: { admin: boolean }) {
       {!data && !error && <p className="comments-loading">正在翻看留言…</p>}
     </div>
     {data && data.totalThreads > 10 && <div className="comments-pagination"><span>第 {data.page} / {Math.ceil(data.totalThreads / 10)} 页</span><div className="pagination"><button className="icon-button" aria-label="上一页留言" disabled={loading || data.page <= 1} onClick={() => { setPage(data.page - 1); setReplying(null); }}><ChevronLeft size={17}/></button><button className="icon-button" aria-label="下一页留言" disabled={loading || data.page >= Math.ceil(data.totalThreads / 10)} onClick={() => { setPage(data.page + 1); setReplying(null); }}><ChevronRight size={17}/></button></div></div>}
-    {login && <CommentLogin session={session} onClose={() => { setLogin(false); refresh(); }} onSuccess={() => { setLogin(false); setNotice('已登录，可以发表你的留言了。'); refresh(); }}/ >}
+    {login && <NicknameDialog onClose={() => { setLogin(false); refresh(); }} onSuccess={() => { setLogin(false); setNotice('昵称已保存，可以发表你的留言了。'); refresh(); }}/>}
     {deleting && <Modal title="删除这条评论？" onClose={() => setDeleting(null)} busy={busy === 'delete'}><p className="modal-intro">评论内容将被移除，无法撤销。如果已有回复，会保留“评论已删除”的占位。</p>{deleteError && <p className="form-error" role="alert">{deleteError}</p>}<div className="form-actions"><button className="secondary" disabled={!!busy} onClick={() => setDeleting(null)}>保留评论</button><button className="primary" disabled={!!busy} onClick={remove}>{busy === 'delete' ? '删除中…' : '确认删除评论'}</button></div></Modal>}
   </section>;
 }

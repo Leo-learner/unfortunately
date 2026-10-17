@@ -1,18 +1,17 @@
 import { z } from 'zod';
-import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 
-const emailSchema = z.string().trim().toLowerCase().email().max(254);
 const boundedText = max => z.string().trim().min(1).refine(s => [...s].length <= max);
 const nicknameSchema = boundedText(24).refine(s => !/[\u0000-\u001f\u007f]/.test(s));
 const postSchema = z.object({
   body: boundedText(2000), replyToId: z.number().int().positive().nullable().default(null),
   clientKey: z.string().uuid(),
 }).strict();
-const hash = text => createHash('sha256').update(text).digest('hex');
 const pageSize = 10;
 
-export function installComments(app, { db, adminEmail, secret, sendCode, production, now, visitorDailyLimit = 200 }) {
-  if (!Number.isInteger(visitorDailyLimit) || visitorDailyLimit < 1) throw new Error('Invalid visitor mail daily limit');
+// Commenters sign in with any dkz12345 Clerk account (req.clerkUser, set by the
+// /api auth middleware). The owner comments as 站长 under adminEmail.
+export function installComments(app, { db, adminEmail, ownerUserId, secret, now }) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS comment_users (
       id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, nickname TEXT, createdAt INTEGER NOT NULL
@@ -37,29 +36,33 @@ export function installComments(app, { db, adminEmail, secret, sendCode, product
     );
     CREATE INDEX IF NOT EXISTS comment_rate_idx ON comment_rate_events(kind, subject, at);
   `);
-  const cookieName = production ? '__Host-unfortunately-visitor' : 'unfortunately-visitor';
-  const cookieOptions = { httpOnly: true, secure: production, sameSite: 'strict', path: '/' };
+  if (!db.prepare('PRAGMA table_info(comment_users)').all().some(c => c.name === 'clerkUserId')) db.exec('ALTER TABLE comment_users ADD COLUMN clerkUserId TEXT');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS comment_users_clerk_idx ON comment_users(clerkUserId)');
   const hmac = text => createHmac('sha256', secret).update(text).digest('hex');
-  const digestCode = (email, nonce, code) => hmac(`visitor:${email}:${nonce}:${code}`);
-  const ensureUser = (email, owner = false) => {
-    db.prepare('INSERT OR IGNORE INTO comment_users VALUES (?, ?, ?, ?)').run(randomUUID(), email, owner ? '站长' : null, now());
-    return db.prepare('SELECT * FROM comment_users WHERE email = ?').get(email);
+  const ensureOwner = () => {
+    db.prepare('INSERT OR IGNORE INTO comment_users (id, email, nickname, createdAt) VALUES (?, ?, ?, ?)').run(randomUUID(), adminEmail, '站长', now());
+    return db.prepare('SELECT * FROM comment_users WHERE email = ?').get(adminEmail);
   };
-  const cookieDigest = req => {
-    const token = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith(cookieName + '='))?.slice(cookieName.length + 1);
-    return token && /^[a-f0-9]{64}$/.test(token) ? hash(token) : null;
-  };
-  const clearVisitor = (req, res) => {
-    const digest = cookieDigest(req);
-    if (digest) db.prepare('DELETE FROM visitor_sessions WHERE digest = ?').run(digest);
-    res.clearCookie(cookieName, cookieOptions);
-  };
+  // Old visitors proved their email with a code, and a Clerk primary email is
+  // verified too, so the first Clerk sign-in with the same email takes over that
+  // commenter. A missing, already-claimed or owner email gets a private
+  // placeholder instead (emails are never shown), so nobody inherits 站长.
+  const visitorFor = db.transaction(clerkUser => {
+    const linked = db.prepare('SELECT * FROM comment_users WHERE clerkUserId = ?').get(clerkUser.id);
+    if (linked) return linked;
+    const email = clerkUser.email?.trim().toLowerCase() || null;
+    const usable = email && email !== adminEmail;
+    const existing = usable ? db.prepare('SELECT * FROM comment_users WHERE email = ?').get(email) : null;
+    if (existing && !existing.clerkUserId) db.prepare('UPDATE comment_users SET clerkUserId = ? WHERE id = ?').run(clerkUser.id, existing.id);
+    else db.prepare('INSERT INTO comment_users (id, email, nickname, createdAt, clerkUserId) VALUES (?, ?, NULL, ?, ?)')
+      .run(randomUUID(), usable && !existing ? email : `clerk:${clerkUser.id}`, now(), clerkUser.id);
+    return db.prepare('SELECT * FROM comment_users WHERE clerkUserId = ?').get(clerkUser.id);
+  });
   app.use('/api/comments', (req, res, next) => {
-    // An existing administrator session is never inferred from a visitor cookie.
-    req.commentUser = req.isAdmin ? ensureUser(adminEmail, true) : db.prepare(`
-      SELECT u.* FROM comment_users u JOIN visitor_sessions s ON s.userId = u.id
-      WHERE s.digest = ? AND s.expiresAt > ?
-    `).get(cookieDigest(req) || '', now());
+    // The owner's account comments as 站长 even when its session is too old for
+    // administration; moderating other people's comments still needs req.isAdmin.
+    const owner = req.isAdmin || req.clerkUser?.id === ownerUserId;
+    req.commentUser = owner ? ensureOwner() : req.clerkUser ? visitorFor(req.clerkUser) : null;
     next();
   });
   const isOwner = user => user?.email === adminEmail;
@@ -68,7 +71,7 @@ export function installComments(app, { db, adminEmail, secret, sendCode, product
     needsNickname: !isOwner(req.commentUser) && !req.commentUser.nickname,
     isOwner: isOwner(req.commentUser),
   } : null, isAdmin: req.isAdmin });
-  const requireUser = (req, res, next) => req.commentUser ? next() : res.status(401).json({ error: '请先通过邮箱验证码登录后再留言。' });
+  const requireUser = (req, res, next) => req.commentUser ? next() : res.status(401).json({ error: '请先登录 dkz12345 统一账号后再留言。' });
   const publicComment = (row, req) => ({
     id: row.id, rootId: row.rootId, replyToId: row.replyToId,
     nickname: row.deletedAt !== null ? null : row.authorEmail === adminEmail ? '站长' : row.nickname,
@@ -94,17 +97,6 @@ export function installComments(app, { db, adminEmail, secret, sendCode, product
   const log = (kind, subject) => db.prepare('INSERT INTO comment_rate_events VALUES (?, ?, ?)').run(kind, subject, now());
   const ipKey = req => hmac(`ip:${req.ip}`);
   const cleanEvents = () => db.prepare('DELETE FROM comment_rate_events WHERE at <= ?').run(now() - 25 * 60 * 60_000);
-  const reserveMail = db.transaction((email, ip) => {
-    cleanEvents();
-    if (count('mail-ip', ip, now() - 15 * 60_000) >= 5) return '验证码请求太频繁，请稍后再试。';
-    const recent = last('mail-email', email);
-    if (recent !== null && now() - recent < 60_000) return '请等待 60 秒后再获取验证码。';
-    if (count('mail-email', email, now() - 60 * 60_000) >= 5) return '该邮箱本小时的验证码次数已用完，请稍后再试。';
-    const dayStart = Math.floor((now() + 8 * 60 * 60_000) / 86400000) * 86400000 - 8 * 60 * 60_000;
-    if (count('mail-global', 'all', dayStart - 1) >= visitorDailyLimit) return '今天的访客验证码发送额度已用完，请明天再试。';
-    log('mail-ip', ip); log('mail-email', email); log('mail-global', 'all');
-    return null;
-  });
   const reservePost = db.transaction((userId, ip) => {
     cleanEvents();
     const recent = last('post-user', userId);
@@ -114,43 +106,6 @@ export function installComments(app, { db, adminEmail, secret, sendCode, product
   });
 
   app.get('/api/comments/session', (req, res) => res.json(session(req)));
-  app.post('/api/comments/auth/request-code', async (req, res) => {
-    const input = z.object({ email: emailSchema }).strict().safeParse(req.body);
-    if (!input.success) return res.status(400).json({ error: '请输入有效的邮箱地址。' });
-    const email = input.data.email;
-    const error = reserveMail(email, ipKey(req));
-    if (error) return res.status(429).json({ error });
-    const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
-    const nonce = randomBytes(16).toString('hex');
-    db.prepare('INSERT OR REPLACE INTO visitor_challenges VALUES (?, ?, ?, ?, 0, ?)').run(email, digestCode(email, nonce, code), nonce, now() + 10 * 60_000, now());
-    try { await sendCode(email, code); res.json({ message: '验证码已发送，请查看邮箱。', retryAfter: 60 }); }
-    catch { db.prepare('UPDATE visitor_challenges SET expiresAt = 0 WHERE email = ? AND nonce = ?').run(email, nonce); res.status(503).json({ error: '验证码暂时无法发送，请稍后重试；邮箱地址已保留。' }); }
-  });
-  app.post('/api/comments/auth/verify', (req, res) => {
-    const ip = ipKey(req);
-    if (count('verify-ip', ip, now() - 15 * 60_000) >= 30) return res.status(429).json({ error: '验证尝试过多，请稍后再试。' });
-    log('verify-ip', ip);
-    const input = z.object({ email: emailSchema, code: z.string().regex(/^\d{6}$/) }).strict().safeParse(req.body);
-    if (!input.success) return res.status(400).json({ error: '邮箱或验证码格式不正确。' });
-    const { email, code } = input.data;
-    const valid = db.transaction(() => {
-      const row = db.prepare('SELECT * FROM visitor_challenges WHERE email = ?').get(email);
-      if (!row || row.expiresAt <= now() || row.attempts >= 5) return false;
-      db.prepare('UPDATE visitor_challenges SET attempts = attempts + 1 WHERE email = ?').run(email);
-      const expected = digestCode(email, row.nonce, code);
-      if (!timingSafeEqual(Buffer.from(expected), Buffer.from(row.digest))) return false;
-      db.prepare('UPDATE visitor_challenges SET expiresAt = 0 WHERE email = ?').run(email);
-      return true;
-    })();
-    if (!valid) return res.status(400).json({ error: '验证码不正确或已过期，请重新获取。' });
-    const user = ensureUser(email);
-    const token = randomBytes(32).toString('hex');
-    db.prepare('DELETE FROM visitor_sessions WHERE expiresAt <= ?').run(now());
-    db.prepare('INSERT INTO visitor_sessions VALUES (?, ?, ?)').run(hash(token), user.id, now() + 30 * 86400000);
-    req.commentUser = user;
-    res.cookie(cookieName, token, { ...cookieOptions, maxAge: 30 * 86400000 }).json(session(req));
-  });
-  app.post('/api/comments/auth/logout', (req, res) => { clearVisitor(req, res); res.json({ ok: true }); });
   app.put('/api/comments/profile', requireUser, (req, res) => {
     const parsed = z.object({ nickname: nicknameSchema }).strict().safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: '昵称须为 1–24 字，不能包含换行。' });
@@ -204,5 +159,4 @@ export function installComments(app, { db, adminEmail, secret, sendCode, product
     if (row.deletedAt === null) db.prepare('UPDATE comments SET body = NULL, deletedAt = ? WHERE id = ?').run(now(), row.id);
     res.json({ ok: true });
   });
-  return { clearVisitor };
 }

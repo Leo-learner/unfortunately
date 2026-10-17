@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ArrowRight, ArrowUpRight, Search, ChevronLeft, ChevronRight, X, Plus, Download, LogOut, RefreshCw, LockKeyhole, Pencil, Trash2, Check, Mail } from 'lucide-react';
+import { ArrowRight, ArrowUpRight, Search, ChevronLeft, ChevronRight, X, Plus, Download, LogOut, RefreshCw, LockKeyhole, Pencil, Trash2, Check } from 'lucide-react';
 import './style.css';
-import { api, ApiError, errorText } from './api';
+import { api, ApiError, errorText, setClerkSession } from './api';
+import { accountPageUrl, loadClerk, requireSignIn, signOut, type ClerkLike } from './vendor/clerk-boot.js';
 import { Modal } from './Modal';
 import { Comments } from './Comments';
 
@@ -23,38 +24,26 @@ type Draft = { company: string; role: string; kind: Kind; appliedOn: string; sta
 const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 const dateLabel = (s: string) => s.replaceAll('-', '.');
 const freshDraft = (): Draft => ({ company: '', role: '', kind: 'internship', appliedOn: today(), status: 'pending', rejectedOn: today(), notes: '' });
-function Login({ onClose, onLogin }: { onClose: () => void; onLogin: () => void }) {
-  const [email, setEmail] = useState('');
-  const [code, setCode] = useState('');
-  const [sent, setSent] = useState(false);
-  const [cooldown, setCooldown] = useState(0);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  useEffect(() => { if (cooldown <= 0) return; const timer = setTimeout(() => setCooldown(cooldown - 1), 1000); return () => clearTimeout(timer); }, [cooldown]);
-  async function send() {
-    setError(''); setBusy(true);
-    try { await api('/auth/request-code', 'POST', { email }); setSent(true); setCooldown(60); }
-    catch (e) { setError(errorText(e)); }
-    finally { setBusy(false); }
-  }
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!sent) return send();
-    setError(''); setBusy(true);
-    try { await api('/auth/verify', 'POST', { email, code }); onLogin(); }
-    catch (e) { setError(errorText(e)); }
-    finally { setBusy(false); }
-  }
-  return <Modal title="回到我的记录本" onClose={onClose} busy={busy} className="login-modal">
+type Access = 'owner' | 'signed-out' | 'reauth-required' | 'not-owner';
+type GateState = 'offline' | 'checking' | 'reauth-required' | 'not-owner';
+// Sign-in itself happens on the shared dkz12345 account page; this explains why
+// the admin view is still closed once you are back.
+function AdminGate({ state, noSecondFactor, onClose }: { state: GateState; noSecondFactor: boolean; onClose: () => void }) {
+  const setup = state === 'reauth-required' && noSecondFactor;
+  const [title, intro] = state === 'offline' ? ['统一账号暂时连不上', '无法连接 dkz12345 统一账号服务，请检查网络后重试。']
+    : state === 'checking' ? ['正在确认身份', '已登录统一账号，正在确认管理权限。如果一直停在这里，请重试。']
+    : state === 'not-owner' ? ['这个账号不是站长', '这里人人可看，只有我能改。如果你是站长，请换成站长的账号登录。']
+    : setup ? ['先开启两步验证', '管理记录本需要两步验证，但这个统一账号还没有设置。请在账号设置的「安全」里添加身份验证器 App（或通行密钥），然后重新登录。']
+    : ['需要重新验证身份', '管理记录本要求 12 小时内完成登录和两步验证。重新登录后会回到这里。'];
+  return <Modal title={title} onClose={onClose} className="login-modal">
     <div className="login-symbol"><LockKeyhole size={24} strokeWidth={1.4}/></div>
-    <p className="modal-intro">这里人人可看，只有我能改。<br/>使用管理员邮箱接收验证码后登录。</p>
-    <form onSubmit={submit}>
-      <label>管理员邮箱<input autoFocus type="email" autoComplete="email" required maxLength={254} placeholder="输入你的邮箱地址" value={email} disabled={sent || busy} onChange={e => setEmail(e.target.value)}/></label>
-      {sent && <><label>邮箱验证码<input autoFocus inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" minLength={6} maxLength={6} required placeholder="6 位验证码" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, ''))}/></label><p className="form-hint" role="status">如果是管理员邮箱，验证码将发送至该邮箱，10 分钟内有效。也请检查垃圾邮件。</p></>}
-      {error && <p className="form-error" role="alert">{error}</p>}
-      <button className="primary full" disabled={busy}>{busy ? '请稍等…' : sent ? '登录记录本' : '发送验证码'}{sent ? <ArrowRight size={17}/> : <Mail size={17}/>}</button>
-      {sent && <div className="login-secondary"><button type="button" className="text-button" disabled={busy || cooldown > 0} onClick={send}>{cooldown > 0 ? `${cooldown} 秒后重新发送` : '重新发送'}</button><button type="button" className="text-button" disabled={busy} onClick={() => { setSent(false); setCode(''); setError(''); }}>更换邮箱</button></div>}
-    </form>
+    <p className="modal-intro">{intro}</p>
+    <div className="form-actions">
+      {setup && <a className="secondary" href={accountPageUrl()} target="_blank" rel="noopener">打开账号设置</a>}
+      {state === 'offline' || state === 'checking'
+        ? <button className="primary" onClick={() => location.reload()}>重试<RefreshCw size={16}/></button>
+        : <button className="primary" onClick={() => void signOut(`${location.origin}/admin`)}>{state === 'not-owner' ? '换一个账号' : setup ? '已开启，重新登录' : '重新登录'}<ArrowRight size={17}/></button>}
+    </div>
   </Modal>;
 }
 
@@ -66,7 +55,7 @@ function EditForm({ record, onClose, onSaved, onUnauthorized }: { record: Applic
   async function submit(e: React.FormEvent) {
     e.preventDefault(); setBusy(true); setError('');
     try { await api(record ? `/admin/applications/${record.id}` : '/admin/applications', record ? 'PUT' : 'POST', { ...draft, rejectedOn: draft.status === 'rejected' ? draft.rejectedOn : null, ...(record ? { version: record.version } : {}) }); onSaved(); }
-    catch (e) { if (e instanceof ApiError && e.status === 401) onUnauthorized(); else setError(errorText(e)); }
+    catch (e) { if (e instanceof ApiError && (e.status === 401 || e.code)) onUnauthorized(); else setError(errorText(e)); }
     finally { setBusy(false); }
   }
   return <Modal title={record ? '修改这次投递' : '又投了一份'} busy={busy} onClose={onClose}>
@@ -88,6 +77,9 @@ function EditForm({ record, onClose, onSaved, onUnauthorized }: { record: Applic
 function App() {
   const [data, setData] = useState<Snapshot | null>(null);
   const [admin, setAdmin] = useState(false);
+  const [access, setAccess] = useState<Access>('signed-out');
+  // undefined while clerk-js loads, null if it could not load.
+  const [clerk, setClerk] = useState<ClerkLike | null | undefined>(undefined);
   const [login, setLogin] = useState(location.pathname === '/admin');
   const [editing, setEditing] = useState<Application | null | undefined>(undefined);
   const [deleting, setDeleting] = useState<Application | null>(null);
@@ -106,13 +98,13 @@ function App() {
     const id = ++requestId.current;
     setLoading(true);
     try {
-      const session = await api<{ authenticated: boolean }>('/session');
+      const session = await api<{ authenticated: boolean; access: Access }>('/session');
       let isAdmin = session.authenticated;
       let result: Snapshot;
       try { result = await api<Snapshot>(isAdmin ? '/admin/applications' : '/public/applications'); }
       catch (e) { if (e instanceof ApiError && e.status === 401) { isAdmin = false; result = await api<Snapshot>('/public/applications'); } else throw e; }
       if (id !== requestId.current) return;
-      setAdmin(isAdmin); setData(result); setError('');
+      setAdmin(isAdmin); setAccess(session.access); setData(result); setError('');
       if (isAdmin) setLogin(false);
     } catch (e) { if (id === requestId.current) setError(errorText(e)); }
     finally { if (id === requestId.current) setLoading(false); }
@@ -125,6 +117,13 @@ function App() {
     const timer = setInterval(onFocus, 30_000);
     return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onFocus); window.removeEventListener('focus', onFocus); };
   }, [refresh]);
+  useEffect(() => {
+    loadClerk().then(instance => { setClerkSession(instance); setClerk(instance); }, () => setClerk(null));
+  }, []);
+  // Signing in, out or switching accounts in another tab changes what we may see.
+  useEffect(() => { if (!clerk) return; refresh(); return clerk.addListener(() => { refresh(); }); }, [clerk, refresh]);
+  // 管理登录 while signed out goes to the shared account page and comes back to /admin.
+  useEffect(() => { if (login && !admin && clerk && !clerk.user) void requireSignIn(`${location.origin}/admin`); }, [login, admin, clerk]);
   useEffect(() => { setPage(1); }, [kind, status, query]);
   useEffect(() => { if (!notice) return; const t = setTimeout(() => setNotice(''), 4500); return () => clearTimeout(t); }, [notice]);
   const items = data?.applications.filter(a => (kind === 'all' || a.kind === kind) && (status === 'all' || a.status === status) && `${a.role} ${admin ? a.company || '' : ''}`.toLowerCase().includes(query.trim().toLowerCase())) || [];
@@ -143,14 +142,14 @@ function App() {
     const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `投递记录-${today()}.csv`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     setNotice('已导出全部记录，文件包含公司名称和私人备注。');
   }
-  async function logout() {
-    try { await api('/auth/logout', 'POST', {}); setAdmin(false); setData(null); setEditing(undefined); setDeleting(null); await refresh(); setNotice('已退出，回到公开视角。'); }
-    catch (e) { setError(errorText(e)); }
+  function logout() {
+    // One sign-out covers every dkz12345 site, so check first.
+    if (window.confirm('退出会同时退出所有 dkz12345 网站的统一账号。确定退出吗？')) void signOut(`${location.origin}/`);
   }
   async function remove() {
     if (!deleting) return; setDeleteBusy(true); setDeleteError('');
     try { await api(`/admin/applications/${deleting.id}`, 'DELETE', { version: deleting.version }); setDeleting(null); setNotice('记录已删除，统计已更新。'); refresh(); }
-    catch (e) { if (e instanceof ApiError && e.status === 401) unauthorized(); else setDeleteError(errorText(e)); }
+    catch (e) { if (e instanceof ApiError && (e.status === 401 || e.code)) unauthorized(); else setDeleteError(errorText(e)); }
     finally { setDeleteBusy(false); }
   }
 
@@ -170,11 +169,11 @@ function App() {
         </div>
         <div className="table-bottom"><span>{data ? hasFilters ? `找到 ${items.length} 条 · 共 ${total} 条投递记录` : `共 ${total} 条投递记录` : '正在加载'}{loading && data && <RefreshCw className="loading-icon" size={12}/>}</span><div className="pagination" aria-label="翻页"><button className="icon-button" disabled={currentPage === 1} aria-label="上一页" onClick={() => setPage(currentPage - 1)}><ChevronLeft size={18}/></button><span>{currentPage} <em>/ {pages}</em></span><button className="icon-button" disabled={currentPage === pages} aria-label="下一页" onClick={() => setPage(currentPage + 1)}><ChevronRight size={18}/></button></div></div>
       </section>
-      <Comments admin={admin}/>
+      <Comments admin={admin} account={clerk?.user?.id ?? null}/>
     </main>
     <footer><p>被拒的是这次申请，不是我。</p><span>{data?.updatedAt ? `最后更新 ${new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(data.updatedAt)).replaceAll('/', '.')}` : '记录，慢慢来。'}</span></footer>
     {notice && <div className="toast" role="status"><Check size={17}/>{notice}</div>}
-    {login && !admin && <Login onClose={() => { setLogin(false); if (location.pathname === '/admin') history.replaceState(null, '', '/'); }} onLogin={() => { setLogin(false); setNotice('欢迎回来，继续写自己的故事。'); refresh(); }}/ >}
+    {login && !admin && clerk !== undefined && (clerk === null || clerk.user) && <AdminGate state={clerk === null ? 'offline' : access === 'signed-out' || access === 'owner' ? 'checking' : access} noSecondFactor={clerk?.user?.twoFactorEnabled === false} onClose={() => { setLogin(false); if (location.pathname === '/admin') history.replaceState(null, '', '/'); }}/>}
     {editing !== undefined && admin && <EditForm record={editing} onClose={() => setEditing(undefined)} onUnauthorized={unauthorized} onSaved={() => { setEditing(undefined); setNotice('已保存到云端，其他设备刷新即可查看。'); refresh(); }}/ >}
     {deleting && admin && <Modal title="删除这次投递？" busy={deleteBusy} onClose={() => setDeleting(null)}><p className="modal-intro">「{deleting.role}」将从记录中移除，相关统计也会更新。此操作无法撤销。</p>{deleteError && <p className="form-error" role="alert">{deleteError}</p>}<div className="form-actions"><button className="secondary" disabled={deleteBusy} onClick={() => setDeleting(null)}>保留记录</button><button className="primary" disabled={deleteBusy} onClick={remove}>{deleteBusy ? '删除中…' : '确认删除'}</button></div></Modal>}
   </>;

@@ -1,10 +1,10 @@
 // Local browser QA only. This file is never run by the production service.
-// Uses a temporary database and a captured test mail; no production credentials.
+// Uses a temporary database and throwaway Clerk test keys; no production credentials.
 import { createApp } from '../server/app.js';
-import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-const { app, db } = createApp({ adminEmail:'qa@example.com', secret:'local-qa-only-abcdefghijklmnopqrstuvwxyz', origin:'http://127.0.0.1:3211', staticDir:resolve('dist'), sendCode: async (_, code) => writeFileSync('../qa-code.txt', code, { mode:0o600 }) });
+import { clerkConfig } from './clerk-fixture.js';
+const { app, db } = createApp({ adminEmail:'qa@example.com', secret:'local-qa-only-abcdefghijklmnopqrstuvwxyz', origin:'http://127.0.0.1:3211', clerk: clerkConfig, staticDir:resolve('dist') });
 if (process.env.QA_SEED === '1') {
   const roles = ['产品设计实习生','前端开发实习生','咖啡店店员','运营实习生','平面设计师'];
   const counts = ['rejected','pending','interview','rejected','accepted',...Array(10).fill('rejected'),...Array(8).fill('pending'),...Array(4).fill('interview'),'accepted'];

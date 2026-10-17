@@ -1,10 +1,11 @@
 import express from 'express';
 import helmet from 'helmet';
-import { rateLimit } from 'express-rate-limit';
 import { z } from 'zod';
-import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { openDatabase, snapshot } from './database.js';
 import { installComments } from './comments.js';
+import { createClerkGate } from './clerk-gate/clerk-gate.js';
+import { ownerSessionAcceptable } from './clerk-gate/owner-policy.js';
 
 const hash = s => createHash('sha256').update(s).digest('hex');
 const emailSchema = z.string().trim().toLowerCase().email().max(254);
@@ -20,16 +21,21 @@ const fields = z.object({
   version: z.number().int().positive().optional(),
 }).strict();
 
-export function createApp({ databasePath = ':memory:', adminEmail, secret, origin, sendCode, production = false, now = Date.now, staticDir, revision = 'development', visitorDailyLimit = 200, mcpAdminKeyHash = '' }) {
+// clerk: the shared dkz12345 Clerk sign-in. Public values only (no Clerk secret
+// key): { publishableKey, jwtKey (PEM public key), ownerUserId }.
+export function createApp({ databasePath = ':memory:', adminEmail, secret, origin, clerk, production = false, now = Date.now, staticDir, revision = 'development', mcpAdminKeyHash = '' }) {
   if (!adminEmail || !secret || secret.length < 32 || !origin) throw new Error('Missing secure application configuration');
+  if (!clerk?.publishableKey || !clerk.jwtKey || !clerk.ownerUserId?.startsWith('user_')) throw new Error('Missing Clerk sign-in configuration');
   if (mcpAdminKeyHash && !/^[a-f0-9]{64}$/.test(mcpAdminKeyHash)) throw new Error('Invalid MCP administrator key hash');
   adminEmail = emailSchema.parse(adminEmail);
+  const gate = createClerkGate({ publishableKey: clerk.publishableKey, jwtKey: clerk.jwtKey, authorizedParties: [origin] });
   const db = openDatabase(databasePath);
   const app = express();
   app.disable('x-powered-by');
   // Only the loopback nginx reverse proxy is trusted.
   app.set('trust proxy', 'loopback');
-  app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:'], connectSrc: ["'self'"], frameAncestors: ["'none'"], upgradeInsecureRequests: production ? [] : null } }, hsts: production ? undefined : false }));
+  // Clerk's script and API, plus Clerk Protect (bot checks) with its worker.
+  app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'", 'https://clerk.dkz12345.com', 'https://*.protect.clerk.com'], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:'], connectSrc: ["'self'", 'https://clerk.dkz12345.com', 'https://*.protect.clerk.com:*'], frameSrc: ['https://*.protect.clerk.com'], workerSrc: ["'self'", 'blob:'], frameAncestors: ["'none'"], upgradeInsecureRequests: production ? [] : null } }, hsts: production ? undefined : false }));
   app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
   app.use('/api', (req, res, next) => {
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
@@ -38,72 +44,40 @@ export function createApp({ databasePath = ':memory:', adminEmail, secret, origi
     next();
   });
   app.use(express.json({ limit: '32kb' }));
-  const cookieName = production ? '__Host-unfortunately' : 'unfortunately-session';
-  const cookieOptions = { httpOnly: true, secure: production, sameSite: 'strict', path: '/' };
-  const sessionDigest = req => {
-    const token = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith(cookieName + '='))?.slice(cookieName.length + 1);
-    return token && /^[a-f0-9]{64}$/.test(token) ? hash(token) : null;
-  };
-  app.use('/api', (req, res, next) => {
-    req.sessionDigest = sessionDigest(req);
+  // Who is asking: the AI administrator key, or a dkz12345 Clerk session token.
+  // Both arrive as `Authorization: Bearer`; the Clerk __session cookie is ignored.
+  // access: owner | reauth-required (owner, but the session fails the owner
+  // policy) | not-owner (any other signed-in account) | signed-out.
+  app.use('/api', async (req, res, next) => {
     const authorization = req.get('authorization');
     const apiKey = authorization?.match(/^Bearer (uf_ai_[a-f0-9]{64})$/)?.[1];
-    // A dedicated key never becomes a browser cookie or a visitor session.
-    const keyAdmin = !!(mcpAdminKeyHash && apiKey && timingSafeEqual(Buffer.from(hash(apiKey), 'hex'), Buffer.from(mcpAdminKeyHash, 'hex')));
-    req.isAdmin = authorization ? keyAdmin : !!(req.sessionDigest && db.prepare('SELECT digest FROM sessions WHERE digest = ? AND expiresAt > ?').get(req.sessionDigest, now()));
+    req.clerkUser = null;
+    if (apiKey) {
+      // A dedicated key never becomes a browser or visitor session.
+      req.isAdmin = !!(mcpAdminKeyHash && timingSafeEqual(Buffer.from(hash(apiKey), 'hex'), Buffer.from(mcpAdminKeyHash, 'hex')));
+      req.access = req.isAdmin ? 'owner' : 'signed-out';
+      return next();
+    }
+    const result = authorization ? await gate.authenticate({ authorization }) : { ok: false };
+    if (!result.ok) { req.isAdmin = false; req.access = 'signed-out'; return next(); }
+    req.clerkUser = result.user;
+    const owner = result.user.id === clerk.ownerUserId;
+    req.isAdmin = owner && ownerSessionAcceptable(result.claims, 'unfortunately') === true;
+    req.access = !owner ? 'not-owner' : req.isAdmin ? 'owner' : 'reauth-required';
     next();
   });
-  const mustAdmin = (req, res, next) => req.isAdmin ? next() : res.status(401).json({ error: '请先登录管理员账号。' });
-  const otpDigest = (code, nonce) => createHmac('sha256', secret).update(`${adminEmail}:${nonce}:${code}`).digest('hex');
-  const sameDigest = (a, b) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
-  const limited = (limit, windowMs) => rateLimit({ limit, windowMs, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: '操作太频繁，请稍后再试。' } });
+  const mustAdmin = (req, res, next) => {
+    if (req.isAdmin) return next();
+    if (req.access === 'signed-out') return res.status(401).json({ error: '请先登录管理员账号。' });
+    const notOwner = req.access === 'not-owner';
+    res.status(403).json({ error: notOwner ? '这个账号不是站长。' : '请重新登录并完成两步验证。', code: notOwner ? 'NOT_OWNER' : 'REAUTH_REQUIRED' });
+  };
 
   app.get('/api/health', (req, res) => { db.prepare('SELECT 1').get(); res.json({ ok: true, revision }); });
-  app.get('/api/session', (req, res) => res.json({ authenticated: req.isAdmin }));
+  app.get('/api/session', (req, res) => res.json({ authenticated: req.isAdmin, access: req.access }));
   app.get('/api/public/applications', (req, res) => res.json(snapshot(db)));
   app.get('/api/admin/applications', mustAdmin, (req, res) => res.json(snapshot(db, true)));
-  app.post('/api/auth/request-code', limited(5, 15 * 60_000), async (req, res) => {
-    const email = emailSchema.safeParse(req.body?.email);
-    if (!email.success) return res.status(400).json({ error: '请输入有效的邮箱地址。' });
-    const generic = { message: '如果是管理员邮箱，验证码会发送到你的邮箱。', retryAfter: 60 };
-    if (email.data !== adminEmail) return res.json(generic);
-    const existing = db.prepare('SELECT sentAt FROM challenges WHERE email = ?').get(adminEmail);
-    if (existing && now() - existing.sentAt < 60_000) return res.status(429).json({ error: '请等待 60 秒后再获取验证码。' });
-    const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
-    const nonce = randomBytes(16).toString('hex');
-    db.prepare('INSERT OR REPLACE INTO challenges (email, digest, nonce, expiresAt, attempts, sentAt) VALUES (?, ?, ?, ?, 0, ?)').run(adminEmail, otpDigest(code, nonce), nonce, now() + 10 * 60_000, now());
-    try {
-      await sendCode(adminEmail, code);
-      res.json(generic);
-    } catch {
-      db.prepare('UPDATE challenges SET expiresAt = 0 WHERE email = ? AND nonce = ?').run(adminEmail, nonce);
-      res.status(503).json({ error: '验证码暂时无法发送，请稍后再试。' });
-    }
-  });
-  app.post('/api/auth/verify', limited(20, 15 * 60_000), (req, res) => {
-    const input = z.object({ email: emailSchema, code: z.string().regex(/^\d{6}$/) }).safeParse(req.body);
-    if (!input.success || input.data.email !== adminEmail) return res.status(400).json({ error: '邮箱或验证码不正确。' });
-    const valid = db.transaction(() => {
-      const challenge = db.prepare('SELECT * FROM challenges WHERE email = ?').get(adminEmail);
-      if (!challenge || challenge.expiresAt <= now() || challenge.attempts >= 5) return false;
-      db.prepare('UPDATE challenges SET attempts = attempts + 1 WHERE email = ?').run(adminEmail);
-      if (!sameDigest(challenge.digest, otpDigest(input.data.code, challenge.nonce))) return false;
-      // Retain sentAt for the cooldown even after successful verification.
-      db.prepare('UPDATE challenges SET expiresAt = 0 WHERE email = ?').run(adminEmail);
-      return true;
-    })();
-    if (!valid) return res.status(400).json({ error: '验证码不正确或已过期，请重新获取。' });
-    const token = randomBytes(32).toString('hex');
-    db.prepare('DELETE FROM sessions WHERE expiresAt <= ?').run(now());
-    db.prepare('INSERT INTO sessions VALUES (?, ?)').run(hash(token), now() + 30 * 24 * 60 * 60_000);
-    res.cookie(cookieName, token, { ...cookieOptions, maxAge: 30 * 24 * 60 * 60_000 }).json({ authenticated: true });
-  });
-  const { clearVisitor } = installComments(app, { db, adminEmail, secret, sendCode, production, now, visitorDailyLimit });
-  app.post('/api/auth/logout', (req, res) => {
-    if (req.sessionDigest) db.prepare('DELETE FROM sessions WHERE digest = ?').run(req.sessionDigest);
-    clearVisitor(req, res);
-    res.clearCookie(cookieName, cookieOptions).json({ ok: true });
-  });
+  installComments(app, { db, adminEmail, ownerUserId: clerk.ownerUserId, secret, now });
   const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(now()));
   const normalize = (body, current) => {
     const result = fields.safeParse(body);
